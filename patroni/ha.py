@@ -21,11 +21,12 @@ from threading import RLock
 logger = logging.getLogger(__name__)
 
 
-class _MemberStatus(namedtuple('_MemberStatus', ['member', 'reachable', 'in_recovery', 'timeline',
+class _MemberStatus(namedtuple('_MemberStatus', ['member', 'state', 'reachable', 'in_recovery', 'timeline',
                                                  'wal_position', 'tags', 'watchdog_failed'])):
     """Node status distilled from API response:
 
         member - dcs.Member object of the node
+        state - state of member
         reachable - `!False` if the node is not reachable or is not responding with correct JSON
         in_recovery - `!True` if pg_is_in_recovery() == true
         timeline - timeline value from JSON
@@ -36,13 +37,14 @@ class _MemberStatus(namedtuple('_MemberStatus', ['member', 'reachable', 'in_reco
     @classmethod
     def from_api_response(cls, member, json):
         is_master = json['role'] == 'master'
+        state = json.get('state','unknown')
         timeline = json.get('timeline', 0)
         wal = not is_master and max(json['xlog'].get('received_location', 0), json['xlog'].get('replayed_location', 0))
-        return cls(member, True, not is_master, timeline, wal, json.get('tags', {}), json.get('watchdog_failed', False))
+        return cls(member, state, True, not is_master, timeline, wal, json.get('tags', {}), json.get('watchdog_failed', False))
 
     @classmethod
     def unknown(cls, member):
-        return cls(member, False, None, 0, 0, {}, False)
+        return cls(member, 'unknown', False, None, 0, 0, {}, False)
 
     def failover_limitation(self):
         """Returns reason why this node can't promote or None if everything is ok."""
@@ -638,7 +640,7 @@ class Ha(object):
         if members:
             for st in self.fetch_nodes_statuses(members):
                 if st.failover_limitation() is None:
-                    if not st.in_recovery:
+                    if not st.in_recovery and st.state != 'unknown':
                         logger.warning('Master (%s) is still alive', st.member.name)
                         return False
                     if my_wal_position < st.wal_position:
@@ -891,8 +893,22 @@ class Ha(object):
         logger.info('Cleaning up failover key')
         self.dcs.manual_failover('', '', index=failover.index)
 
+    def _has_alive_master(self):
+        all_known_members = self.cluster.members + self.old_cluster.members
+        members = {m.name: m for m in all_known_members}
+        members = [m for m in members.values() if m.name != self.state_handler.name and not m.nofailover and m.api_url]
+        if members:
+            for st in self.fetch_nodes_statuses(members):
+                if st.failover_limitation() is None:
+                    if not st.in_recovery and st.state != 'unknown':
+                        return True
+        return False
+
     def process_unhealthy_cluster(self):
         """Cluster has no leader key"""
+        # if old master is still alive, we won't failover
+        if self._has_alive_master():
+            return 'Would not failover, as master is still alive'
 
         if self.is_healthiest_node():
             if self.acquire_lock():
